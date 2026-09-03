@@ -7,6 +7,200 @@ from matplotlib.colors import LinearSegmentedColormap
 from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, precision_score, recall_score, roc_curve
 import plots as p
 import phik
+from sklearn.base import clone
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTENC
+from sklearn.base import clone
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+def train_evaluate_models_cv_SMOTE(models: list, X, y, preprocessor=None, cv=5, seed=None, smote_params=None):
+    """
+    models: список кортежей (name, model)
+    preprocessor: ColumnTransformer / OneHotEncoder и т.п. (может быть None)
+    smote_params: dict с параметрами SMOTE/SMOTENC, например:
+        {'type': 'SMOTENC', 'categorical_features': [0,1,2], 'sampling_strategy': 0.4, 'k_neighbors': 5}
+    """
+    from imblearn.base import BaseSampler
+
+    all_metrics = {}
+
+    for model_name, base_model in models:
+        current_model = clone(base_model)
+
+        # 1. Если нужен SMOTE — оборачиваем его в пайплайн
+        if smote_params is not None:
+            smote_type = smote_params.get('type', 'SMOTENC')
+            if smote_type == 'SMOTENC':
+                from imblearn.over_sampling import SMOTENC
+                smote = SMOTENC(
+                    categorical_features=smote_params['categorical_features'],
+                    sampling_strategy=smote_params.get('sampling_strategy', 0.5),
+                    k_neighbors=smote_params.get('k_neighbors', 5),
+                    random_state=seed
+                )
+            else:
+                from imblearn.over_sampling import SMOTE
+                smote = SMOTE(
+                    sampling_strategy=smote_params.get('sampling_strategy', 0.5),
+                    k_neighbors=smote_params.get('k_neighbors', 5),
+                    random_state=seed
+                )
+
+            # Пайплайн: SMOTE -> (опционально preprocessor) -> модель
+            steps = [('smote', smote)]
+            if preprocessor is not None:
+                steps.append(('preprocess', clone(preprocessor)))
+            steps.append(('model', current_model))
+
+            final_pipeline = ImbPipeline(steps=steps)
+        else:
+            # Без SMOTE: просто preprocessor + модель
+            if preprocessor is not None:
+                final_pipeline = ImbPipeline(steps=[
+                    ('preprocess', clone(preprocessor)),
+                    ('model', current_model)
+                ])
+            else:
+                final_pipeline = current_model
+
+        all_metrics[model_name] = train_evaluate_model_cv(
+            final_pipeline, model_name, X, y, None, cv, seed
+        )
+
+    metrics_df = pd.DataFrame.from_dict(all_metrics, orient='index')
+
+    plt.figure(figsize=(8, 4))
+    sns.heatmap(metrics_df, cmap='RdBu_r', annot=True, fmt=".4f")
+    plt.title('Model Evaluation Metrics Comparison')
+    plt.tight_layout()
+    plt.show()
+
+    return metrics_df
+
+def train_evaluate_model_cv(model, model_name, X, y,
+                            preprocessor=None, cv=5, seed=None):
+    """
+    Train and evaluate a model using cross-validation and optional preprocessing.
+    No Pipeline used — preprocessor is applied manually per fold.
+
+    Args:
+        model: The model to train and evaluate
+        model_name: Name of the model for reporting
+        X: Features (DataFrame or array)
+        y: Target labels
+        preprocessor: Preprocessing object with fit/transform, or None
+        cv: Number of cross-validation folds or a CV splitter object
+        seed: Random seed for reproducibility
+
+    Returns:
+        Dictionary containing evaluation metrics
+    """
+    # Set random seed if model supports it
+    if seed is not None:
+        if hasattr(model, 'random_state'):
+            model.set_params(random_state=seed)
+        if hasattr(model, 'seed'):
+            model.set_params(seed=seed)
+
+    # Prepare CV splitter
+    if isinstance(cv, int):
+        cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
+    else:
+        cv_splitter = cv
+
+    # Check if X is DataFrame (use .iloc) or array (use direct indexing)
+    is_dataframe = hasattr(X, 'iloc')
+    is_series = hasattr(y, 'iloc')
+
+    roc_auc_scores = []
+    f1_scores = []
+    precision_scores = []
+    recall_scores = []
+    accuracy_scores = []
+
+    for train_idx, val_idx in cv_splitter.split(X, y):
+        X_train = X.iloc[train_idx] if is_dataframe else X[train_idx]
+        X_val = X.iloc[val_idx] if is_dataframe else X[val_idx]
+        y_train = y.iloc[train_idx] if is_series else y[train_idx]
+        y_val = y.iloc[val_idx] if is_series else y[val_idx]
+
+        # Apply preprocessor manually (fit on train, transform on val)
+        if preprocessor is not None:
+            X_train_proc = preprocessor.fit_transform(X_train)
+            X_val_proc = preprocessor.transform(X_val)
+        else:
+            X_train_proc, X_val_proc = X_train, X_val
+
+        # Clone model for this fold
+        model_fold = clone(model)
+        model_fold.fit(X_train_proc, y_train)
+
+        y_pred = model_fold.predict(X_val_proc)
+
+        # predict_proba есть не у всех моделей
+        if hasattr(model_fold, 'predict_proba'):
+            y_proba = model_fold.predict_proba(X_val_proc)[:, 1]
+        else:
+            y_proba = None
+
+        accuracy_scores.append(accuracy_score(y_val, y_pred))
+        precision_scores.append(precision_score(y_val, y_pred, average='macro', zero_division=0))
+        recall_scores.append(recall_score(y_val, y_pred, average='macro', zero_division=0))
+        f1_scores.append(f1_score(y_val, y_pred, average='macro', zero_division=0))
+
+        if y_proba is not None and len(np.unique(y_val)) > 1:
+            roc_auc_scores.append(roc_auc_score(y_val, y_proba))
+        else:
+            roc_auc_scores.append(np.nan)
+
+    metrics = {
+        'ROC AUC': np.nanmean(roc_auc_scores),
+        'F1 Score': np.mean(f1_scores),
+        'Precision': np.mean(precision_scores),
+        'Recall': np.mean(recall_scores),
+        'Accuracy': np.mean(accuracy_scores),
+    }
+
+    # График (если p доступен)
+    try:
+        p.plot_classification_results(metrics, model_name)
+    except NameError:
+        pass
+
+    return metrics
+
+def train_evaluate_models_cv(models: list, X, y, preprocessor=None, cv=5, seed=None):
+    # Dictionary to store all metrics
+    all_metrics = {}
+
+    for model_name, model in models:
+        # Работаем с копией модели
+        current_model = clone(model)
+
+        # Клонируем preprocessor только если он передан
+        current_preprocessor = clone(preprocessor) if preprocessor is not None else None
+
+        # Store metrics
+        all_metrics[model_name] = train_evaluate_model_cv(
+            current_model, model_name, X, y, current_preprocessor, cv, seed)
+
+    # Convert metrics to DataFrame
+    metrics_df = pd.DataFrame.from_dict(all_metrics, orient='index')
+
+    # Plot heatmap
+    plt.figure(figsize=(8, 4))
+    sns.heatmap(metrics_df, cmap='RdBu_r', annot=True, fmt=".2f")
+    plt.title('Model Evaluation Metrics Comparison')
+    plt.tight_layout()
+    plt.show()
+
+    return metrics_df
 
 def calculate_classification_metrics(y_test, y_pred, y_probs=None):
     """
